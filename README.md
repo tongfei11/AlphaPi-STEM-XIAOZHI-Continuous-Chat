@@ -1,8 +1,10 @@
-# AlphaPi STEM 小智固件
+# AlphaPi STEM 小智连续对话固件
 
 基于 [shj4588/AlphaPi-STEM-XIAOZHI](https://github.com/shj4588/AlphaPi-STEM-XIAOZHI) 的 V2.3.2，适用于 AlphaPi STEM / Zero 的 ESP32-C3、4 MB Flash 和 5×5 点阵。本 fork 的固件标记为 `V2.3.2 local-0014`。
 
 0014 将已验证的 0013 整理为独立固件仓库，录音、连续对话和阈值与 0013 相同。上游基线为 `2ae2d058831518468d68ce415d04cb1892d4ffe2`，原项目说明保存在 [README.upstream.md](README.upstream.md)。
+
+可从 [Releases](https://github.com/tongfei11/AlphaPi-STEM-XIAOZHI-Continuous-Chat/releases) 下载已编译的主程序 `.bin` 和 SHA-256 校验文件。0014 的主程序写入地址为 `0x10000`。
 
 ## 按键
 
