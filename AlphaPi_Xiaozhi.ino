@@ -1,4 +1,11 @@
 /*
+ * local-0004：连接动画 → 联网成功 WiFi 短显 → 笑脸待机；普通语音回复显示喇叭。
+ * local-0009：Opus 改用任务栈作为临时工作区，修复按 C 录音编码时重启。
+ * local-0010：B 长按进入连续对话，C 短按退出，C 长按手动说一句。
+ * local-0011：连续模式适应底噪，限制每轮录音时间，提交后显示思考图案。
+ * local-0012：配网页增加本地麦克风电平测量，可比较底噪和人声。
+ * local-0013：用实测麦克风电平调整连续对话的起音和停顿阈值。
+ * 空闲休眠和录放音调度沿用 V2.3.2。
  * AlphaPi_Xiaozhi —— STEM 板（ESP32-C3）极简小智 AI 客户端
  * V2.1.5（2026-10-01）：**诊断精简** ——「讲着讲着没声」结案后，把周期诊断从"每 2s 两行"收到"每 2s 一行"。
  *   ★结案依据（整合版 V2.1.4 烧录实测，官方服务器，同句"讲一个2分钟的故事"）：
@@ -195,12 +202,15 @@
 #include <esp_heap_caps.h>   // ★V2.1.4：DMA 堆诊断（heap_caps_get_free_size / largest_free_block）
 #include <esp_sleep.h>      // ★V2.3.2：深度休眠（GPIO 唤醒，参照 PageTurner V1.0.5）
 #include <opus.h>
+#include <math.h>
+#include "MicLevels.h"
+#include "TalkControls.h"
 
 // ================== 固件版本（唯一出处）==================
 // ★升版本只改这一行：AP 配置页标题 + 串口启动横幅都由它渲染，避免漏改。
 #define XZ_FW_VERSION "V2.3.2"
 // 实验版识别标记（正式版留空字符串 ""）：同一处渲染 —— 烧进去后一眼能认版本。
-#define XZ_FW_TAG ""
+#define XZ_FW_TAG " local-0014"
 
 // loopTask 栈：opus SILK 编码路径峰值 15-25KB，默认 8KB 必爆。
 // ★V2.1.3：48000 → 32768。依据是**实测**而非估算 —— V2.1.2 加的栈高水位打点显示，
@@ -241,9 +251,8 @@ static const int BTN_PIN = 3;  // C 键，低有效（板上外部下拉，按�
 // A 键 GPIO10：长按 5s 开配置热点（无串口/网页进不去时的物理救援入口）
 static const int BTN_A_PIN = 10;
 static const int BTN_B_PIN = 1;  // B 键：短按打断播放
-static bool btnAHeld = false;
-static bool btnALong = false;  // ★V2.2.2：本次按下已判为长按（松开时不再当单击）
-static uint32_t btnAAt = 0;
+static KeyGesture keyA, keyB, keyC;
+static const uint32_t HOLD_A_MS = 2000, HOLD_B_MS = 650, HOLD_C_MS = 350;
 
 WebSocketsClient ws;
 Preferences prefs;
@@ -274,15 +283,26 @@ static const uint32_t IDLE_DISCONNECT_MS = 60000;
 static uint32_t lastConvAt = 0;  // 最近会话活动时刻：空闲 60s 主动断开（按需连接架构）
 
 // ---- ★V2.3.2 深度休眠（参照 PageTurner V1.0.5 的 1.0.5 实现）----
-// C3 深睡只有 RTC GPIO(0~5) 能当唤醒源：C=GPIO3 ✓（A=GPIO10 不行，B=GPIO1 可但用户只要 C）。
-// 深睡唤醒 = 整机复位重启（setup 重跑、WiFi 重连），所以醒来后靠 wakeByCKey 标志，
-// 在 setup 末尾若 C 仍按住就直接 startTalk() —— 与待机"按住 C 说话"完全一致。
+// C3 深睡由 RTC GPIO 唤醒：B=GPIO1、C=GPIO3。重新联网后仍按住即可开始说话。
 #define SLEEP_IDLE_MS 60000UL    // ★用户指定：60 秒无动作即入深睡（改这里；0 = 不休眠）
-static bool wakeByCKey = false;      // 本次启动由 C 键从深睡唤醒
+static const uint64_t TALK_WAKE_PINS = (1ULL << BTN_PIN) | (1ULL << BTN_B_PIN);
 static uint32_t lastVolActAt = 0;    // 音量键也算"交互"，避免调着音量突然睡
 
 // 上行状态机：0=空闲 1=录音中（停止为阻塞式，无需中间态）
-static uint8_t recPhase = 0;
+static volatile uint8_t recPhase = 0;
+enum class TalkState : uint8_t { Idle, Manual, Continuous, ManualReply, ContinuousReply };
+static TalkState talkState = TalkState::Idle;
+static VoiceTurn voiceTurn;
+static uint32_t talkWaitAt = 0;
+static const uint32_t REPLY_TIMEOUT_MS = 30000;
+static volatile ReplyEnd replyEnd = ReplyEnd::Pending;
+enum class MicTest : uint8_t { Idle, Noise, Speech };
+static MicTest micRequest = MicTest::Idle;
+static MicTest micActive = MicTest::Idle;
+static MicReading micNoise, micSpeech;
+static const char* micStatus = "请选择一项测试。";
+static const uint32_t MIC_PREPARE_MS = 1500;
+static const uint32_t MIC_SAMPLE_MS = 4000;
 
 static String deviceId() {
   String s = WiFi.macAddress();
@@ -834,6 +854,18 @@ static inline uint8_t volHwOf(uint8_t lv) {
 // 泵让路标志已删除：V2.2.3 起音量/图标帧都由泵任务自己发（单一写者），不需要暂停泵，
 // 也不需要清 RX（清 RX 会把在途 PCM 应答一起吃掉 ⇒ 重发风暴 ⇒ 调音量时断流）。
 static volatile bool dlPumpBusy = false;   // 泵正在执行（仅任务外层置位，诊断用）
+static volatile bool audioPumpPaused = false;
+static volatile bool audioPumpWorking = false;
+
+// 主循环接管协控前，先等泵完成正在执行的 UART 操作。C3 为单核。
+class PauseAudioPump {
+ public:
+  PauseAudioPump() {
+    audioPumpPaused = true;
+    while (audioPumpWorking) delay(1);
+  }
+  ~PauseAudioPump() { audioPumpPaused = false; }
+};
 static uint32_t dlShortAcks = 0;        // ★V2.1.7：短收次数（协控只吃下部分字节）
 static uint32_t dlShort2s = 0;          // 最近 2s 的短收次数
 static uint32_t dlSentDbgPrev = 0;      // 2s 喂送速率统计基准
@@ -883,7 +915,7 @@ uint32_t dlFrames = 0, dlBytes = 0, dlDropped = 0, dlDecErr = 0;
 static const int DEC_BUF_SAMPLES = 2880;
 static int16_t decBuf[DEC_BUF_SAMPLES];
 
-static void endDlPlay(const char* why);
+static void endDlPlay(const char* why, ReplyEnd result = ReplyEnd::Failed);
 static void stopDlPlayHard();
 
 // ================== ★手段④：0x80 寄存器扫描探针（2026-10-10）==================
@@ -1244,14 +1276,25 @@ static const uint8_t MTX_P_WIFI_OFF[25] = {  // 配网门户已关（大 X）
   1,0,0,0,1
 };
 
+static const uint8_t MTX_P_SPEAKER[25] = {
+  0,0,1,0,0,
+  0,1,1,0,1,
+  1,1,1,0,1,
+  0,1,1,0,1,
+  0,0,1,0,0
+};
+
 // ---- 意图状态机：想显示什么(mtxWant) vs 已上屏什么(mtxCur) ----
-enum { MTX_I_CLEAR = 0, MTX_I_MIC, MTX_I_THINK, MTX_I_PLAY, MTX_I_MUSIC, MTX_I_FACE };
+enum { MTX_I_CLEAR = 0, MTX_I_MIC, MTX_I_THINK, MTX_I_PLAY, MTX_I_MUSIC, MTX_I_FACE, MTX_I_WIFI, MTX_I_IDLE };
 static uint8_t mtxWant = MTX_I_CLEAR;
 static uint8_t mtxCur = 0xFF;               // 0xFF=未知（开机首帧必发）
 static const uint8_t* mtxFace = MTX_P_NEUTRAL;  // 最近一次情绪脸
 static bool mtxMusic = false;               // 本次 TTS=点歌（sentence_start 含 % play_music）
 static uint32_t mtxFailUntil = 0;           // 无响应熔断截止时刻
 static uint8_t mtxFailCnt = 0;              // 连续失败轮数（阶梯重试：前 10 轮 2s 一试=覆盖协控晚开机，之后 30s）
+static bool mtxWifiConnected = false;
+static uint32_t mtxWifiConnectedAt = 0;
+static const uint32_t MTX_WIFI_SUCCESS_MS = 3000;
 
 static void mtxSet(uint8_t id) { mtxWant = id; }
 static void mtxSetFace(const uint8_t* face) { mtxFace = face; mtxWant = MTX_I_FACE; }
@@ -1310,9 +1353,11 @@ static const uint8_t* mtxPatternOf(uint8_t id) {
   switch (id) {
     case MTX_I_MIC:   return MTX_P_MIC;
     case MTX_I_THINK: return MTX_P_THINK;
-    case MTX_I_PLAY:  return MTX_P_SMILE;  // V2.0.2：播放中显示笑脸（用户偏好，替换三角）
+    case MTX_I_PLAY:  return MTX_P_SPEAKER;
     case MTX_I_MUSIC: return MTX_P_MUSIC;
-    case MTX_I_FACE:  return mtxFace;
+    case MTX_I_FACE:  return (dlActive && !mtxMusic) ? MTX_P_SPEAKER : mtxFace;
+    case MTX_I_WIFI:  return MTX_P_WIFI_ON;
+    case MTX_I_IDLE:  return MTX_P_SMILE;
     default:          return MTX_P_CLEAR;
   }
 }
@@ -1347,6 +1392,15 @@ static bool mtxSend(const uint8_t p[25]) {
 
 // 真正发送：只在总线空闲瞬间调用（loop/endDlPlay/各状态切换点）
 static void mtxFlush() {
+  bool connected = (WiFi.status() == WL_CONNECTED);
+  if (connected && !mtxWifiConnected) mtxWifiConnectedAt = millis();
+  mtxWifiConnected = connected;
+  // 联网成功短显 WiFi，之后笑脸待机。录音、播放和音量图案保留更高优先级。
+  if (mtxWant == MTX_I_CLEAR || mtxWant == MTX_I_WIFI || mtxWant == MTX_I_IDLE) {
+    if (!connected) mtxWant = MTX_I_CLEAR;
+    else if (millis() - mtxWifiConnectedAt < MTX_WIFI_SUCCESS_MS) mtxWant = MTX_I_WIFI;
+    else mtxWant = MTX_I_IDLE;
+  }
   if (mtxWant == mtxCur) return;
   if (recPhase != 0 || dlActive) return;                  // 录音/播放期间总线忙
   // ★V2.2.9：音量柱状图显示期内不许覆盖（否则空闲按音量键只闪一下就没了）
@@ -1365,6 +1419,22 @@ static void mtxFlush() {
   if (mtxFailCnt) Serial.printf("[MTX] 点阵恢复应答（第%d轮成功）\n", mtxFailCnt);
   mtxFailCnt = 0;
   mtxCur = mtxWant;
+}
+
+// 连接路由器期间，两颗像素沿点阵边缘旋转，每 500ms 更新一帧。
+// 此阶段尚未启动录放音任务，显示应答由下一次阻塞点阵写入统一清理。
+static void mtxConnectingFrame() {
+  static const uint8_t positions[8] = { 2, 4, 14, 24, 22, 20, 10, 0 };
+  static uint32_t frameAt = 0;
+  static uint8_t frame = 0;
+  if (frameAt && millis() - frameAt < 500) return;
+  uint8_t pattern[25] = {0};
+  pattern[positions[frame]] = 1;
+  pattern[positions[(frame + 7) % 8]] = 1;
+  mtxSendFast(pattern);
+  mtxCur = 0xFF;  // 连接成功或超时后，下一次 mtxFlush 必须覆盖动画。
+  frame = (frame + 1) % 8;
+  frameAt = millis();
 }
 
 // 一次性短显图案（A 键配网门户开关提醒用）：直发 → 停留 1s → 清屏。
@@ -1453,7 +1523,7 @@ static void startDlPlay() {
   Serial.println("[DL] 播放开始（流控泵运转，TTS 流式喂入）");
 }
 
-static void endDlPlay(const char* why) {
+static void endDlPlay(const char* why, ReplyEnd result) {
   dlActive = false;
   dlWantStart = false;
   dlPendCnt = 0;
@@ -1495,7 +1565,7 @@ static void endDlPlay(const char* why) {
   //   末尾按过键的挂起柱状图还会在结束后再点亮一次（用户看到"播完了图案不灭"）。
   volShowPend = false;
   volIconAt = 0;
-  // 播放结束灭屏（用户指定）：覆盖任何挂起意图（包括播放中缓存的表情）
+  // 播放结束回待机：覆盖挂起意图（包括播放中缓存的表情），由 mtxFlush 恢复待机图案。
   // ★V2.1.0 例外：服务器"响应未完成就断连"（故事被打断）⇒ 打一张失望脸。
   //   播放期点阵被总线仲裁禁发，只有这里（dlActive 刚置 false、总线空出来）能上屏；
   //   对用户而言这是"为什么没声了"的唯一可见答案，比静悄悄灭屏有用得多。
@@ -1507,13 +1577,14 @@ static void endDlPlay(const char* why) {
     mtxWant = MTX_I_CLEAR;
   }
   mtxFlush();  // 总线回到空闲：灭屏（清残显）
+  replyEnd = result;
 }
 
 // 硬打断：清 FIFO+清 RX（协控把已收数据播完自然停，无播放停止指令——官方 stopPlay
 // 同款语义：interrupt() 只停本地喂帧，不发 UART 停止命令）。★置打断封锁：服务器
 // abort 生效前在途的音乐帧会继续涌入，没有封锁就会重新攒满 FIFO 复活播放。
 static void stopDlPlayHard() {
-  if (!dlActive) return;
+  if (!dlActive && !dlWantStart && dlAvail() == 0) return;
   dlActive = false;
   dlWantStart = false;
   dlBarged = true;
@@ -1902,7 +1973,7 @@ static void pumpPlay() {
       }
       // tts stop 后仍有尾包迟到（实测 10 帧/1.8s），等 1500ms 让尾包进 FIFO 播完
       if (ttsDone && now - dlLastAudioAt > 1500 && ahead < MS2B(100)) {
-        endDlPlay("tts结束");
+        endDlPlay("tts结束", ReplyEnd::Played);
         return;
       }
       // ---- ★V2.0.9 兜底分级：先看"链路死没死"，再谈"服务器卡了多久" ----
@@ -2048,10 +2119,13 @@ static void pumpPlay() {
 static TaskHandle_t pumpTaskH = nullptr;
 static void pumpTaskFunc(void*) {
   for (;;) {
-    if (recPhase == 0) {
-      volApplyPending();  // ★录音中绝不插命令（RX 是麦克风 PCM）
-      volService();       // 音量下发（帧间隙）+ 柱状图（去抖/限流）
+    if (audioPumpPaused || recPhase != 0) {
+      vTaskDelay(1);
+      continue;
     }
+    audioPumpWorking = true;
+    volApplyPending();
+    volService();
     if (!dlActive && dlWantStart) {
       dlWantStart = false;
       startDlPlay();
@@ -2073,6 +2147,7 @@ static void pumpTaskFunc(void*) {
         mtxFlush();
       }
     }
+    audioPumpWorking = false;
     vTaskDelay(1);
   }
 }
@@ -2176,7 +2251,7 @@ static void handleAudio(uint8_t* payload, size_t len) {
   int32_t jitterGate = MS2B(DL_JITGATE_MS);
   if (jitterGate > (int32_t)(DL_SIZE - PLAY_CHUNK - 1))
     jitterGate = (int32_t)(DL_SIZE - PLAY_CHUNK - 1);
-  if (!dlActive && dlAvail() >= jitterGate && millis() > dlRetryAt) {
+  if (!dlActive && (dlAvail() >= jitterGate || (ttsDone && dlAvail() > 0)) && millis() > dlRetryAt) {
     dlWantStart = true;  // ★V2.2.0：起播交给泵任务（回调里不碰协控串口）
   }
 }
@@ -2286,32 +2361,36 @@ static void coPumpRecord() {
 // upPosAcc 跨帧保留小数位置：帧内独立会导致每帧边界重复 1 样本（每秒 16 次颗粒声）
 static uint64_t upPosAcc = 0;  // 相对 upTail 的定点读位置（跨帧连续）
 
+// Both voice and the local meter use the same 24 kHz to 16 kHz samples.
+static bool takeUplinkFrame() {
+  const uint64_t step = ((uint64_t)CO_RATE << 32) / SAMPLE_RATE;
+  const uint64_t endPos = upPosAcc + (uint64_t)FRAME_SAMPLES * step;
+  if (upAvail() < (uint16_t)((endPos >> 32) + 1)) return false;
+  uint64_t p = upPosAcc;
+  for (int k = 0; k < FRAME_SAMPLES; k++) {
+    const uint32_t idx = (uint32_t)(p >> 32);
+    // Low-pass adjacent input samples before downsampling.
+    const int cur = upBuf[(upTail + idx) & UP_MASK];
+    const int prev = upBuf[(upTail + idx - 1) & UP_MASK];
+    upEnc16[k] = (int16_t)((((cur + prev) >> 1) - 128) * 256);
+    p += step;
+  }
+  upTail += (uint16_t)(p >> 32);
+  upPosAcc = p & 0xFFFFFFFF;
+  return true;
+}
+
 static void drainUplink() {
   if (!wsReady) {
     upTail = upHead;
     upPosAcc = 0;
     return;
-  }                                                               // 未握手直接丢
-  const uint64_t step = ((uint64_t)CO_RATE << 32) / SAMPLE_RATE;  // 必须 uint64
-  // 限时预算 40ms：每圈 1.3+ 帧 = 80ms+ 音频/75ms 圈 → 编码吞吐 ≥107%
-  uint32_t tEnc = millis();
-  while (millis() - tEnc < 40) {
-    uint64_t endPos = upPosAcc + (uint64_t)FRAME_SAMPLES * step;
-    if (upAvail() < (uint16_t)((endPos >> 32) + 1)) return;  // 输入不足一帧
-    uint64_t p = upPosAcc;
-    for (int k = 0; k < FRAME_SAMPLES; k++) {
-      uint32_t idx = (uint32_t)(p >> 32);
-      // 一阶低通（相邻输入样本平均）：24000→16000 下采样必须滤 8kHz 以上防混叠。
-      // 注意必须取 idx-1 的相邻样本！曾误用上一次输出的跳步样本（频响畸变），
-      // 恰是 ASR 识别劣化元凶
-      int cur = upBuf[(upTail + idx) & UP_MASK];
-      int prev = upBuf[(upTail + idx - 1) & UP_MASK];  // idx=0 时环形取上一帧末字节
-      int v = (cur + prev) >> 1;
-      upEnc16[k] = (int16_t)((v - 128) << 8);  // 8bit 无符号 → 16bit 有符号
-      p += step;
+  }
+  const uint32_t startedAt = millis();
+  while (millis() - startedAt < 40 && takeUplinkFrame()) {
+    if (talkState == TalkState::Continuous) {
+      voiceTurn.observe(measurePcm(upEnc16, FRAME_SAMPLES, false).deviation, millis());
     }
-    upTail += (uint16_t)(p >> 32);  // 消费整数部分字节
-    upPosAcc = p & 0xFFFFFFFF;      // 保留小数给下一帧
     uint32_t t0e = micros();
     int npkt = opus_encode(enc, upEnc16, FRAME_SAMPLES, upPkt + 2, MAX_PACKET);
     uint32_t dtUs = micros() - t0e;
@@ -2321,9 +2400,10 @@ static void drainUplink() {
     if (npkt > 0) {
       // 裸 opus 上行（无 [0x01,0x01] 帧头）——对齐 S2 官方固件与本地服务器预期。
       // 曾带帧头：server 把 0x01 0x01 当 opus 数据 → 每包前 2 字节污染 → ASR 只吐单字
-      ws.sendBIN(upPkt + 2, npkt);
-      upFrames++;
-      upSentBytes += npkt;
+      if (ws.sendBIN(upPkt + 2, npkt)) {
+        upFrames++;
+        upSentBytes += npkt;
+      }
     }
   }
 }
@@ -2361,33 +2441,11 @@ static bool ensureConnected() {
   return false;
 }
 
-// 按下 C 键：打断 TTS → listen start → 协控启动录音
-static void startTalk() {
-  if (recPhase != 0) return;
-  bool wasPlaying = dlActive;               // 本轮打断前是否在播 TTS/音乐
-  if (dlActive) stopDlPlayHard();  // 软打断 TTS
-  if (!ensureConnected()) {
-    Serial.println("[TALK] 未连上服务器，松开重试");
-    return;
-  }
-  // 打断通知：TTS/音乐进行中按 C = 用户要求中断生成。必须显式发 abort，
-  // 否则服务器不知道要停，继续推歌、LLM 上下文还挂在播放会话上（实测：问星期几回歌词）。
-  // 判据：刚打断播放(wasPlaying) 或 上一轮 TTS 未收到 stop(!ttsDone)。
-  if (wasPlaying || !ttsDone) sendAbort();
-  lastConvAt = millis();
-  mtxSet(MTX_I_MIC);   // 点阵：麦克风图标（此刻总线空闲，先于录音启动帧发出）
-  mtxFlush();
-  sendListen(true);
-  // 协控启动录音（阻塞等 ACK，官方同款）
+// Called on the main loop with the playback pump paused.
+static bool beginCapture() {
   while (coUart.available()) coUart.read();
-  uint8_t start[5] = { 0x90, CMD_CTL, 0x01, 0x01, 0 };
-  start[4] = (uint8_t)(0x90 + CMD_CTL + 0x01 + 0x01);
-  int r = sendWait(start, 5);
-  if (r < 0) {
-    Serial.println("[TALK] 协控录音启动无响应");
-    return;
-  }
-  // 复位上行状态
+  const uint8_t start[5] = { 0x90, CMD_CTL, 0x01, 0x01, (uint8_t)(0x90 + CMD_CTL + 2) };
+  if (sendWait(start, 5) < 0) return false;
   upTail = upHead = 0;
   upPosAcc = 0;
   recBytes = 0;
@@ -2399,19 +2457,133 @@ static void startTalk() {
   _recDataGot = 0;
   _lastPoll = 0;
   recPhase = 1;
-  Serial.println("[TALK] 开始说话（松开结束，录音中无日志属正常）");
+  return true;
 }
 
-// 松开 C 键：listen stop → 协控停止（阻塞等 ACK）→ 统计
-static void stopTalk() {
-  if (recPhase != 1) return;
-  recPhase = 0;
-  lastConvAt = millis();
-  sendListen(false);
-  uint8_t stopF[5] = { 0x90, CMD_CTL, 0x01, 0x00, 0 };
-  stopF[4] = (uint8_t)(0x90 + CMD_CTL + 0x01);
-  sendWait(stopF, 5);
+static void haltCapture() {
+  const uint8_t stop[5] = { 0x90, CMD_CTL, 0x01, 0x00, (uint8_t)(0x90 + CMD_CTL + 1) };
+  sendWait(stop, 5);
   while (coUart.available()) coUart.read();
+}
+
+static void releaseCapture() {
+  upFrames = 0;
+  upSentBytes = 0;
+  dlDropped = 0;
+  upSkipped = 0;
+  pollCount = 0;
+  pollSum = 0;
+  pollMax = 0;
+  encFrames = 0;
+  encTotalUs = 0;
+  encMaxUs = 0;
+  upTail = upHead;
+  recPhase = 0;
+}
+
+static void stopMicTest(bool completed) {
+  micRequest = MicTest::Idle;
+  if (micActive == MicTest::Idle) return;
+  MicReading& reading = micActive == MicTest::Noise ? micNoise : micSpeech;
+  haltCapture();
+  releaseCapture();
+  micActive = MicTest::Idle;
+  mtxSet(MTX_I_CLEAR);
+  if (!completed || reading.frames < 30) {
+    reading = MicReading{};
+    micStatus = completed ? "收到的麦克风采样不足，请重试。" : "测试已取消。";
+    return;
+  }
+  micStatus = "测量完成。";
+}
+
+static bool micTestCanStart() {
+  return cfgMode && !cfgRebootAt && !recPhase && talkState == TalkState::Idle &&
+         !dlActive && !dlWantStart && dlAvail() == 0 && ttsDone;
+}
+
+static void startRequestedMicTest() {
+  if (micRequest == MicTest::Idle) return;
+  const MicTest requested = micRequest;
+  micRequest = MicTest::Idle;
+  if (!micTestCanStart()) {
+    micStatus = "请先结束当前对话，再开始测试。";
+    return;
+  }
+  PauseAudioPump pause;
+  if (wsReady) ws.disconnect();
+  volIconAt = 0;
+  mtxSet(MTX_I_MIC);
+  mtxFlush();
+  if (!beginCapture()) {
+    mtxSet(MTX_I_CLEAR);
+    micStatus = "麦克风启动无响应，请重试。";
+    return;
+  }
+  (requested == MicTest::Noise ? micNoise : micSpeech) = MicReading{};
+  micActive = requested;
+}
+
+static void drainMicTest() {
+  const uint32_t elapsed = millis() - recStartAt;
+  if (elapsed < MIC_PREPARE_MS) {
+    upTail = upHead;
+    upPosAcc = 0;
+    return;
+  }
+  MicReading& reading = micActive == MicTest::Noise ? micNoise : micSpeech;
+  while (takeUplinkFrame()) reading.observe(upEnc16, FRAME_SAMPLES);
+  if (elapsed >= MIC_PREPARE_MS + MIC_SAMPLE_MS) stopMicTest(true);
+}
+
+static void startTalk(bool continuous) {
+  if (recPhase != 0 || !enc) return;
+  lastConvAt = millis();
+  if (!ensureConnected()) {
+    Serial.println("[TALK] 未连上服务器，请重试");
+    return;
+  }
+  if (!continuous && digitalRead(BTN_PIN) == LOW) return;
+  PauseAudioPump pause;
+  if (dlActive || dlWantStart || dlAvail() > 0 || !ttsDone || talkState != TalkState::Idle) {
+    sendAbort();
+    stopDlPlayHard();
+    dlBarged = true;
+  }
+  dlRespOpen = false;
+  ttsDone = true;
+  talkState = TalkState::Idle;
+  volIconAt = 0;
+  mtxSet(MTX_I_MIC);   // 点阵：麦克风图标（此刻总线空闲，先于录音启动帧发出）
+  mtxFlush();
+  if (!continuous && digitalRead(BTN_PIN) == LOW) {
+    mtxSet(MTX_I_CLEAR);
+    return;
+  }
+  if (!beginCapture()) {
+    Serial.println("[TALK] 协控录音启动无响应");
+    mtxSet(MTX_I_CLEAR);
+    return;
+  }
+  voiceTurn = VoiceTurn{};
+  replyEnd = ReplyEnd::Pending;
+  talkState = continuous ? TalkState::Continuous : TalkState::Manual;
+  sendListen(true);
+  Serial.println(continuous ? "[TALK] 连续模式：开始聆听" : "[TALK] 开始说话（松开 C 发送）");
+}
+
+// 结束录音：正常提交发 listen stop，取消则由调用者关闭当前会话。
+static void stopTalk(bool submit) {
+  if (recPhase != 1) return;
+  lastConvAt = millis();
+  if (submit) {
+    talkWaitAt = lastConvAt;
+    talkState = talkState == TalkState::Continuous ? TalkState::ContinuousReply : TalkState::ManualReply;
+    sendListen(false);
+  } else {
+    talkState = TalkState::Idle;
+  }
+  haltCapture();
   uint32_t ms = (recFirstDataAt && recFirstDataAt < millis())
                   ? millis() - recFirstDataAt
                   : millis() - recStartAt;
@@ -2425,28 +2597,61 @@ static void stopTalk() {
                 (unsigned long)(pollCount ? pollSum / pollCount : 0),
                 (unsigned long)encFrames,
                 (unsigned long)(encFrames ? encTotalUs / encFrames : 0));
-  upFrames = 0;
-  upSentBytes = 0;
-  dlDropped = 0;
-  upSkipped = 0;
-  pollCount = 0;
-  pollSum = 0;
-  pollMax = 0;
-  encFrames = 0;
-  encTotalUs = 0;
-  encMaxUs = 0;
-  upTail = upHead;
-  mtxSet(MTX_I_CLEAR);  // 点阵：录音结束灭屏（V2.0.2 用户偏好：不要菱形，等 LLM/TTS）
-  mtxFlush();
+  releaseCapture();
+  mtxSet(talkState == TalkState::ContinuousReply ? MTX_I_THINK : MTX_I_CLEAR);
 }
 
-// ========== 按键（非阻塞防抖沿检测）==========
-// 硬件：按键外部下拉输入，按下=高电平！（曾误写 INPUT_PULLUP 低有效 →
-// 上电自动 startTalk 且按/松极性全反）
+static void cancelTalk() {
+  if (talkState == TalkState::Idle && !dlActive && !dlWantStart && ttsDone) return;
+  stopTalk(false);
+  {
+    PauseAudioPump pause;
+    stopDlPlayHard();
+    dlBarged = true;
+    dlRespOpen = false;
+    ttsDone = true;
+    talkState = TalkState::Idle;
+    replyEnd = ReplyEnd::Pending;
+    mtxSet(MTX_I_CLEAR);
+  }
+  if (wsReady) sendAbort();
+  ws.disconnect();
+  lastConvAt = millis();
+  Serial.println("[TALK] 会话已结束");
+}
 
-static bool btnStable = LOW;
-static uint32_t btnEdgeAt = 0;
-static bool btnBStable = LOW;   // B 键（GPIO1）：短按打断 TTS/音乐
+static void talkTick() {
+  const uint32_t now = millis();
+  if (talkState == TalkState::Continuous) {
+    const uint32_t captureMs = now - recStartAt;
+    const TurnAction action = voiceTurn.action(now, captureMs, upFrames != 0);
+    if (!wsReady || action == TurnAction::Cancel) {
+      cancelTalk();
+    } else if (action == TurnAction::Submit) {
+      Serial.printf("[TALK] 连续模式：%s提交，底噪 %u，已发 %lu 帧\n",
+                    captureMs >= VoiceTurn::maxCaptureMs ? "到达录音上限，" : "检测到句尾，",
+                    (unsigned)voiceTurn.noise, (unsigned long)upFrames);
+      stopTalk(true);
+    }
+    return;
+  }
+  if (talkState == TalkState::Manual) {
+    if (!wsReady) cancelTalk();
+    else if (now - recStartAt >= 60000) stopTalk(true);
+    return;
+  }
+  if (talkState != TalkState::ManualReply && talkState != TalkState::ContinuousReply) return;
+  if (dlActive || dlWantStart || audioPumpWorking) return;
+  if (replyEnd == ReplyEnd::Played && ttsDone && dlAvail() == 0) {
+    if (keyC.raw || keyC.down) return;  // 先让用户的打断手势完成
+    const bool rearm = talkState == TalkState::ContinuousReply && wsReady;
+    talkState = TalkState::Idle;
+    replyEnd = ReplyEnd::Pending;
+    if (rearm) startTalk(true);
+  } else if (!wsReady || replyEnd == ReplyEnd::Failed || now - talkWaitAt >= REPLY_TIMEOUT_MS) {
+    cancelTalk();
+  }
+}
 
 // ========== ★V2.2.3 音量控制（A 单击 -，B 单击 +；25 档，1 像素=1 档）==========
 // 协控音量寄存器 0x14 直接收 0..100（One 板同款 N32）。命令帧与播放帧同格式：
@@ -2503,10 +2708,6 @@ static int volWriteHardwareBlocking() {
 // 按键只做这一件事：改目标档位。真正的串口动作在泵任务里（volApplyPending）。
 static void volStep(int8_t d) {
   lastVolActAt = millis();  // ★V2.3.2：调音量也算交互，别刚调完就休眠
-  if (recPhase != 0) {  // 录音中协控串口是上行 PCM，绝不能插命令
-    Serial.println("[VOL] 录音中忽略音量键");
-    return;
-  }
   int nv = (int)volTarget + d;
   if (nv < (int)VOL_MIN_LV) nv = VOL_MIN_LV;
   if (nv > (int)VOL_MAX_LV) nv = VOL_MAX_LV;
@@ -2515,13 +2716,13 @@ static void volStep(int8_t d) {
     //   旧版直接 return 导致"按加键屏幕没反应"，用户以为按键失效。
     volShowPend = true;
     volShowAt = millis();
-    Serial.printf("[VOL] 已到%s限 %u/%u（重刷图案）\n", d > 0 ? "上" : "下",
+    if (recPhase == 0) Serial.printf("[VOL] 已到%s限 %u/%u（重刷图案）\n", d > 0 ? "上" : "下",
                   (unsigned)volTarget, (unsigned)VOL_LEVELS);
     return;
   }
   volTarget = (uint8_t)nv;
   volPending = true;  // 泵任务下一 tick 落地（≈1ms），连点只会覆盖成最新值，不会排队卡顿
-  Serial.printf("[VOL] 目标 %u/%u 档（硬件 %u）%s\n", (unsigned)volTarget,
+  if (recPhase == 0) Serial.printf("[VOL] 目标 %u/%u 档（硬件 %u）%s\n", (unsigned)volTarget,
                 (unsigned)VOL_LEVELS, (unsigned)volHwOf(volTarget),
                 dlActive ? "播放中→立即下发" : "");
 }
@@ -2588,36 +2789,22 @@ static void volService() {
 }
 
 static void pollButton() {
-  bool b = digitalRead(BTN_PIN);
-  if (b != btnStable) {
-    if (btnEdgeAt == 0) btnEdgeAt = millis();
-    else if (millis() - btnEdgeAt > 30) {
-      btnStable = b;
-      btnEdgeAt = 0;
-      if (btnStable == HIGH) startTalk();  // 按下=高电平=开始说话
-      else stopTalk();                     // 松开=低电平=停止，等 TTS
-    }
-  } else {
-    btnEdgeAt = 0;
+  const uint32_t now = millis();
+  const KeyEvent c = keyC.update(digitalRead(BTN_PIN), now, HOLD_C_MS);
+  const KeyEvent b = keyB.update(digitalRead(BTN_B_PIN), now, HOLD_B_MS);
+  if (c == KeyEvent::Tap) {
+    if (micActive != MicTest::Idle || micRequest != MicTest::Idle) stopMicTest(false);
+    else cancelTalk();
+  } else if (c == KeyEvent::Hold) {
+    if (talkState == TalkState::Continuous) cancelTalk();
+    startTalk(false);
+  } else if (c == KeyEvent::ReleaseHold && talkState == TalkState::Manual) {
+    drainUplink();
+    stopTalk(true);
   }
-
-  // ★V2.2.3：B 键单击 = 音量 +（取消原来的"B 短按打断"，打断统一走 C）。
-  // 松开沿触发，30~600ms 算单击；取消 300ms 限频——连点每一下都计数（只改目标档位，
-  // 不碰串口，所以再快也不会排队或卡顿）。
-  static uint32_t btnBDownAt = 0;
-  bool bb = digitalRead(BTN_B_PIN);
-  if (bb != btnBStable) {
-    btnBStable = bb;
-    if (bb == HIGH) {
-      btnBDownAt = millis();  // 按下沿
-    } else {
-      uint32_t held = btnBDownAt ? (millis() - btnBDownAt) : 0;
-      btnBDownAt = 0;
-      if (held > 30 && held < 600 && btnStable == LOW) {
-        volStep(+1);
-      }
-    }
-  }
+  if (b == KeyEvent::Tap) volStep(+1);
+  else if (b == KeyEvent::Hold && c == KeyEvent::None && !keyC.raw &&
+           (talkState == TalkState::Idle || talkState == TalkState::ManualReply)) startTalk(true);
 }
 
 // ========== WebSocket 协议 ==========
@@ -2784,6 +2971,7 @@ static void handleText(uint8_t* payload, size_t len) {
         ttsDone = true;
         dlFeedDone = true;
         dlRespOpen = false;  // 响应正常收尾
+        if (!dlActive && dlAvail() > 0 && millis() > dlRetryAt) dlWantStart = true;
       } else if (msg.indexOf("\"state\":\"start\"") >= 0) {
         ttsDone = false;
         dlRespOpen = true;   // ★V2.0.9：响应开始，等 stop 才算收尾（断开定责用）
@@ -2817,6 +3005,7 @@ static void handleText(uint8_t* payload, size_t len) {
 static void wsEvent(WStype_t type, uint8_t* payload, size_t len) {
   switch (type) {
     case WStype_CONNECTED:
+      dlBarged = false;
       wsLastRxAt = millis();  // ★V2.1.0：死链检测基线
       wsRxMaxAll = 0; wsRxBigAll = 0; wsRxNTotal = 0;   // ★V2.1.3 新会话重新计数
       wsPingTx = 0; wsPingFail = 0; wsPingRx = 0; wsPongRx = 0;
@@ -3058,8 +3247,7 @@ static void officialOta() {
 //   beginSSL 作用在还连着本地服务器的旧明文 socket 上 → TLS 握手永远出不来 → 6s 超时。
 //   （串口 'r' 命令一直是对的：先 disconnect 再 connect——本函数对齐该时序）
 static void serverSwitchTeardown() {
-  if (recPhase) stopTalk();              // 说话中：先干净收尾
-  if (dlActive) endDlPlay("切换服务器");  // 播放中：停播灭屏（残帧随断连作废）
+  cancelTalk();
   wsReady = false;
   ws.disconnect();
   delay(50);                             // 等 DISCONNECTED 事件出队
@@ -3119,6 +3307,76 @@ static bool cfgCheckToken() {
   if (cfgWeb->arg("t") != String(cfgToken)) return false;  // 旧页面重放
   cfgToken = 0;                                         // 一次性：消费即作废
   return true;
+}
+
+static bool micPageOnDeviceHotspot() {
+  if (cfgWeb->client().localIP() == WiFi.softAPIP()) return true;
+  cfgWeb->send(403, "text/plain; charset=utf-8", "请连到 AlphaPi 自己的配网热点，再打开收音测试。");
+  return false;
+}
+
+static String micDbfs(uint64_t energy, uint32_t samples) {
+  if (!energy || !samples) return "−∞ dBFS";
+  return String(10.0f * log10f((float)energy / samples / (32768.0f * 32768.0f)), 1) + " dBFS";
+}
+
+static String micReadingRow(const char* label, const MicReading& reading) {
+  String row = String("<tr><th scope='row'>") + label + "</th>";
+  if (!reading.frames) return row + "<td colspan='4'>待测量</td></tr>";
+  row += "<td>" + micDbfs(reading.energy, reading.samples) + "</td>";
+  row += "<td>" + micDbfs((uint64_t)reading.peak * reading.peak, 1) + "</td>";
+  row += "<td>" + String(reading.p90()) + "</td>";
+  return row + "<td>" + String(reading.samples / (float)SAMPLE_RATE, 1) + " 秒</td></tr>";
+}
+
+static void cfgMicPage() {
+  if (!micPageOnDeviceHotspot()) return;
+  const bool running = micActive != MicTest::Idle || micRequest != MicTest::Idle;
+  String h = "<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>"
+             "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+             "<title>收音测试</title>";
+  if (running) h += "<meta http-equiv='refresh' content='1'>";
+  h += "<style>body{font:16px system-ui,sans-serif;margin:16px;max-width:540px}"
+       "th,td{padding:8px 4px;text-align:left;font-size:14px}button{padding:8px;margin:0 4px 8px 0}"
+       "table{width:100%;border-collapse:collapse}tr{border-bottom:1px solid #ccc}</style></head><body>"
+       "<p><a href='/'>返回配网</a></p><h2>收音测试</h2>"
+       "<p>先保持安静测底噪，再用平时的音量和距离测说话。每次准备约 1.5 秒，随后测量约 4 秒。</p>";
+  if (running) {
+    const MicTest kind = micActive != MicTest::Idle ? micActive : micRequest;
+    h += "<p role='status'><strong>";
+    if (micActive == MicTest::Idle || millis() - recStartAt < MIC_PREPARE_MS) h += "准备中…";
+    else h += kind == MicTest::Noise ? "正在测底噪，请保持安静。" : "正在测说话，请现在开口。";
+    h += "</strong></p>";
+  } else {
+    h += String("<p role='status'>") + micStatus + "</p>";
+    h += "<form method='post' action='/mic'><input type='hidden' name='t' value='" + cfgNewToken() + "'>"
+         "<button name='kind' value='noise'>测底噪</button>"
+         "<button name='kind' value='speech'>测说话</button></form>";
+  }
+  h += "<table><thead><tr><th>项目</th><th>平均电平</th><th>峰值</th><th>分句电平 P90</th><th>采样</th>"
+       "</tr></thead><tbody>";
+  h += micReadingRow("底噪", micNoise);
+  h += micReadingRow("说话", micSpeech);
+  h += "</tbody></table><p>平均电平是 RMS，dBFS 越接近 0 越响。P90 是分句使用的采样幅度。"
+       "测试仅在板上统计电平。</p></body></html>";
+  cfgWeb->sendHeader("Cache-Control", "no-store");
+  cfgWeb->send(200, "text/html; charset=utf-8", h);
+}
+
+static void cfgMicStart() {
+  if (!micPageOnDeviceHotspot()) return;
+  const String kind = cfgWeb->arg("kind");
+  if (!cfgCheckToken() || (kind != "noise" && kind != "speech")) {
+    cfgWeb->send(400, "text/plain; charset=utf-8", "请重新打开收音测试页再试。");
+    return;
+  }
+  if (micRequest != MicTest::Idle || micActive != MicTest::Idle || !micTestCanStart()) {
+    cfgWeb->send(409, "text/plain; charset=utf-8", "请先结束当前对话或测试，再开始新的测量。");
+    return;
+  }
+  micRequest = kind == "noise" ? MicTest::Noise : MicTest::Speech;
+  cfgWeb->sendHeader("Location", "/mic");
+  cfgWeb->send(303, "text/plain", "");
 }
 
 static void cfgSendPage(const String& msg = "") {
@@ -3238,6 +3496,7 @@ static void cfgSendPage(const String& msg = "") {
        "<p class='v'>当前已是本地模式且这四项都没改时，点按钮<b>只刷新状态、设备不重启</b>；"
        "改过任一项才写入并重启生效。</p></fieldset>";
   h += "<fieldset><legend>操作</legend>"
+       "<p><a href='/mic'>收音测试：测底噪和说话电平</a></p>"
        "<form action='/reboot'><input type='hidden' name='t' value='" + tok + "'>"
        "<button>重启设备</button></form>"
        "<p class='v'>所有按钮都是一次性的：<b>刷新页面 / 回退再提交不会重复执行</b>"
@@ -3372,6 +3631,8 @@ static void cfgStart() {
   WiFi.softAP(ap.c_str());          // 开放网络，配置页无敏感操作风险
   cfgWeb = new WebServer(80);
   cfgWeb->on("/", []() { cfgSendPage(); });
+  cfgWeb->on("/mic", HTTP_GET, cfgMicPage);
+  cfgWeb->on("/mic", HTTP_POST, cfgMicStart);
   cfgWeb->on("/savewifi", cfgSaveWifi);
   cfgWeb->on("/uselocal", cfgUseLocal);
   cfgWeb->on("/activate", cfgActivate);
@@ -3389,6 +3650,7 @@ static void cfgStart() {
 
 static void cfgStop() {
   if (!cfgMode) return;
+  stopMicTest(false);
   if (cfgWeb) { cfgWeb->stop(); delete cfgWeb; cfgWeb = nullptr; }
   cfgMode = false;
   WiFi.softAPdisconnect(true);
@@ -3403,31 +3665,16 @@ static void cfgStop() {
 // （切服务器/配 WiFi/激活）；关=门户收摊回纯 STA。切换后点阵显示 WiFi 图标 1s 提醒。
 // 说话/播放中忽略（防切断会话）；门户开着时长按 A = 关门户。
 static void pollBtnA() {
-  bool pressed = digitalRead(BTN_A_PIN);
-  if (pressed && !btnAHeld) {
-    btnAHeld = true;
-    btnAAt = millis();
-    btnALong = false;
-  } else if (!pressed && btnAHeld) {
-    btnAHeld = false;
-    // ★V2.2.3：A 单击（<800ms）= 音量 -。长按已处理过的这次松开不再算单击。
-    uint32_t held = millis() - btnAAt;
-    if (!btnALong && held > 30 && held < 800) volStep(-1);
-  }
-  if (btnAHeld && millis() - btnAAt >= 2000) {
-    btnAHeld = false;
-    btnALong = true;
-    if (recPhase || dlActive) {
-      Serial.println("[CFG] A 长按忽略（会话进行中）");
-      return;
-    }
+  const KeyEvent a = keyA.update(digitalRead(BTN_A_PIN), millis(), HOLD_A_MS);
+  if (a == KeyEvent::Tap) {
+    volStep(-1);
+  } else if (a == KeyEvent::Hold && talkState == TalkState::Idle && !dlActive && !dlWantStart) {
+    lastVolActAt = millis();
+    PauseAudioPump pause;
     if (cfgMode) {
-      // ---- 关 AP 配置门户（STA 保持）----
       cfgStop();
-      Serial.println("[CFG] 配置门户已关闭（A 长按 2s）——STA 保持连接");
       mtxBrief(MTX_P_WIFI_OFF);
     } else {
-      // ---- 开 AP 配置门户（cfgStart 内部 WIFI_AP_STA，STA 不断）----
       cfgStart();
       mtxBrief(MTX_P_WIFI_ON);
     }
@@ -3439,7 +3686,7 @@ static void pollBtnA() {
 // 睡前必须收干净：断 WS → 关 WiFi/射频 → 灭屏 → 配 GPIO 电平唤醒 → esp_deep_sleep_start()。
 // 深睡唤醒在 C3 上是**整机复位重启**，所以"唤醒后直接说话"只能靠 setup 里重新检测按键。
 static void enterDeepSleep() {
-  Serial.printf("[SLEEP] 空闲 %lus，进入深度休眠（长按 C 唤醒并直接说话）\n",
+  Serial.printf("[SLEEP] 空闲 %lus，进入深度休眠（按 B/C 唤醒）\n",
                 (unsigned long)(SLEEP_IDLE_MS / 1000));
   if (dlActive) stopDlPlayHard();            // 理论上不会（条件已排除），兜底
   // 休眠动画（与翻页器一致）：闪 2 次 X（MTX_P_WIFI_OFF = 大叉），每次 220ms。
@@ -3456,8 +3703,7 @@ static void enterDeepSleep() {
   WiFi.mode(WIFI_OFF);                       // 关射频：深睡电流从 mA 级降到 µA 级
   coUart.flush();
   Serial.flush();
-  // C3 深睡只有 RTC GPIO(0~5) 能唤醒；C=GPIO3，板上外部下拉，按下=高电平
-  esp_deep_sleep_enable_gpio_wakeup(1ULL << BTN_PIN, ESP_GPIO_WAKEUP_GPIO_HIGH);
+  esp_deep_sleep_enable_gpio_wakeup(TALK_WAKE_PINS, ESP_GPIO_WAKEUP_GPIO_HIGH);
   delay(50);
   esp_deep_sleep_start();                    // 不返回；醒来 = setup() 重跑
   Serial.println("[SLEEP] ⚠️ 深睡启动失败（未返回），继续运行");
@@ -3465,7 +3711,7 @@ static void enterDeepSleep() {
 
 static void sleepTick() {
   if (SLEEP_IDLE_MS == 0) return;
-  if (dlActive || recPhase != 0 || cfgMode) return;   // 播放/录音/配网：绝不睡
+  if (dlActive || talkState != TalkState::Idle || cfgMode || keyA.raw || keyB.raw || keyC.raw) return;
   uint32_t ref = (lastConvAt > lastVolActAt) ? lastConvAt : lastVolActAt;
   if (millis() - ref < SLEEP_IDLE_MS) return;
   enterDeepSleep();
@@ -3475,11 +3721,10 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.println("\n=== AlphaPi_Xiaozhi " XZ_FW_VERSION XZ_FW_TAG " (ESP32-C3) ===");
-  // ★V2.3.2：本次是不是 C 键从深睡唤醒（深睡唤醒=复位重启，只能靠这个标志接力）
-  wakeByCKey = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO);
-  if (wakeByCKey) Serial.println("[SLEEP] C 键唤醒（深睡重启）：初始化完若仍按住就直接说话");
+  const uint64_t wakePins = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO
+                                ? esp_sleep_get_gpio_wakeup_status() : 0;
   Serial.printf("Device-Id: %s\n", deviceId().c_str());
-  Serial.println("按住 C=说话/播放中按下即打断 | A 单击=音量- | B 单击=音量+（25 档，1 像素1档）| A 长按2s=配网门户");
+  Serial.println("A 短按减音量 / 长按配网 | B 短按加音量 / 长按连续对话 | C 短按结束 / 长按说一句");
   // ★V2.1.3：顺带把 loopTask 栈大小打出来 —— 48000→32768 是否生效一眼可见
   Serial.printf("[MEM] 启动堆 %u KB（WiFi/协控 UART 前）| loopTask 栈 %u B\n",
                 ESP.getFreeHeap() / 1024, (unsigned)getArduinoLoopTaskStackSize());
@@ -3569,8 +3814,10 @@ void setup() {
     Serial.printf("[WiFi] 连接 %s ", wifiSsid.c_str());
     uint32_t wifiT0 = millis();
     wifiOk = true;
+    mtxConnectingFrame();
     while (WiFi.status() != WL_CONNECTED) {
       delay(250);
+      mtxConnectingFrame();
       Serial.print(".");
       if (millis() - wifiT0 > 20000) { wifiOk = false; break; }  // 20s 超时：可能密码错/AP 不在
     }
@@ -3583,6 +3830,7 @@ void setup() {
   Serial.printf("[MEM] 堆剩余 %u KB（WiFi 后，20KB 下行 FIFO 已计入；最大连续块 %u KB）\n",
                 ESP.getFreeHeap() / 1024,
                 heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024);
+  mtxFlush();  // 联网结果立即上屏，后续激活流程等待期间也能看到 WiFi 图标。
 
   loadServer();
   // 自愈：旧版 bug 可能把"(已激活)"写进 NVS 而实际无 token（NVS 烧录不擦除，跨固件残留）
@@ -3643,16 +3891,14 @@ void setup() {
   Serial.println("[WS] 待机（按需连接：按住说话时才连，官方 S2 同款架构）");
   Serial.println("命令: o=切官方(快照优先) l=切本地 a=联网核对激活 i=信息 h=hello 1/0=listen w=配置网页 s=停止 r=重连 F=恢复出厂 v=详细诊断  A长按2s=配网门户开关");
 
-  // ★V2.3.2：C 键深睡唤醒 → 初始化完若仍按住，直接进入对话（与待机按住 C 完全一致）
-  if (wakeByCKey) {
-    wakeByCKey = false;
-    if (digitalRead(BTN_PIN) == HIGH) {
-      Serial.println("[SLEEP] 唤醒时 C 仍按住 → 直接开始对话");
-      btnStable = HIGH;   // 视作"已按下"：松手时才走 stopTalk，避免再触发一次 startTalk
-      startTalk();
-    } else {
-      Serial.println("[SLEEP] 唤醒时 C 已松开 → 正常待机");
-    }
+  // 从深睡醒来需先连 WiFi；仍按住的按键直接进入对应模式。
+  lastVolActAt = millis();
+  if ((wakePins & (1ULL << BTN_PIN)) && digitalRead(BTN_PIN) == HIGH) {
+    keyC.resumeHeld();
+    startTalk(false);
+  } else if ((wakePins & (1ULL << BTN_B_PIN)) && digitalRead(BTN_B_PIN) == HIGH) {
+    keyB.resumeHeld();
+    startTalk(true);
   }
 }
 
@@ -3682,7 +3928,10 @@ void loop() {
   hbTick();    // ★V2.1.3 自建心跳（关掉库心跳后唯一的 ping 来源，失败只记账）
   pollButton();
   pollBtnA();  // A 键长按 2s 切换 AP 配网门户开/关（STA 不受影响，图标提醒）
-  mtxFlush();  // 点阵意图补发（内部判总线空闲+熔断，忙时零开销返回）
+  if (!audioPumpWorking && recPhase == 0 && !dlActive && !dlWantStart) {
+    PauseAudioPump pause;
+    mtxFlush();
+  }
   // ★V2.2.3：音量落盘推迟到空闲（NVS 提交会卡 10~40ms，播放中写 flash 就是一次断流）。
   // 图标 1.5s 后的恢复动作已交给泵任务（播放中也走非阻塞快速路径）。
   if (volSaveDirty && !dlActive && recPhase == 0 && millis() - volSaveAt > 800) {
@@ -3696,7 +3945,9 @@ void loop() {
 
   // Web 配置门户：运行期服务 + 延时重启收尾
   if (cfgMode && cfgWeb) cfgWeb->handleClient();
+  startRequestedMicTest();
   if (cfgRebootAt && millis() > cfgRebootAt) {
+    stopMicTest(false);
     cfgRebootAt = 0;
     Serial.println("[CFG] 保存完成，重启...");
     delay(100);
@@ -3715,13 +3966,10 @@ void loop() {
 
   if (recPhase == 1) {
     coPumpRecord();  // 协控录音泵（零打印）
-    drainUplink();
-    // 60 秒上限保护：防误触超长上行（曾 3 分钟 4495 帧，疑似触发服务器限流）
-    if (millis() - recStartAt > 60000) {
-      stopTalk();
-      Serial.println("[TALK] 录音超 60s，自动停止");
-    }
+    if (micActive != MicTest::Idle) drainMicTest();
+    else drainUplink();
   }
+  talkTick();
 
   // ★V2.2.0：播放泵已移到 dlpump 任务，主循环不再调用（否则两边抢协控串口）
   accPumpUs += 0;
@@ -3840,8 +4088,7 @@ void loop() {
       if (cfgMode) cfgStop();
       else cfgStart();
     } else if (c == 's') {  // 紧急停止
-      if (recPhase == 1) stopTalk();
-      if (dlActive) endDlPlay("手动停止");
+      cancelTalk();
       Serial.println("[SRV] 已全部停止");
     } else if (c == 'r') {  // 重连 WebSocket
       wsReady = false;
